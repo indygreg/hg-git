@@ -1,8 +1,8 @@
-import os, math, urllib, re
+import os, math, urllib, re, stat
 
 from dulwich.errors import HangupException, GitProtocolError
 from dulwich.index import commit_tree
-from dulwich.objects import Blob, Commit, Tag, Tree, parse_timezone
+from dulwich.objects import Blob, Commit, Tag, Tree, TreeEntry, parse_timezone
 from dulwich.pack import create_delta, apply_delta
 from dulwich.repo import Repo
 from dulwich import client
@@ -66,6 +66,270 @@ class GitProgress(object):
         self.lasttopic = None
         if msg:
             self.ui.note(msg + '\n')
+
+
+class TreeTracker(object):
+    """Tracks incremental changes to Git trees.
+
+    This class essentially models a Git "root" tree (a tree referenced by a
+    commit). It also contains data from all sub-trees.
+
+    The magic in this class is incremental change processing. You can feed it
+    a changectx and it performs the minimal work necessary to update the tree
+    for that changectx.
+
+    This class exists to make Git exporting faster. It allows us to
+    incrementally compute Git trees without having to exhaustively iterate
+    files in a changeset.
+
+    There are two main factors contributing to the performance wins.
+
+    First, we avoid having to iterate the entire manifest when moving between
+    revisions. This avoids having to compute the full manifest, iterating over
+    it, and possibly grabbing raw content from Mercurial to compute hashes.
+
+    The second big performance win is from caching Tree objects. Tree
+    calculation is not cheap, at least in dulwich. By only constructing Tree
+    objects from trees that have actually changed since the last time they were
+    retrieved, we net a huge performance win.
+
+    Crude benchmarking reveals that each optimization above results in about a
+    4-5x improvement over the inefficient case. Together, they represent a
+    16-20x speedup over the unoptimized case.
+    """
+
+    def __init__(self, repo):
+        """Create a new tree tracker seeded with a specific changectx."""
+
+        self.repo = repo
+        self.rev = None
+        self.node = None
+        self.dirs = None
+        self.tree_cache = None
+        self.dirty_trees = None
+
+    def update_revision(self, rev, incremental=True):
+        """Update the revision that we track.
+
+        This is how you update the TreeTracker to point to a different commit.
+        """
+        ctx = self.repo.changectx(rev)
+
+        rev = ctx.rev()
+        node = ctx.node()
+
+        if self.rev is None or not incremental:
+            self._populate_full(ctx)
+            return
+
+        # We attempt to find nodes between the previously tracked revision and
+        # the new one. If we find them, we walk that path and update state
+        # incrementally. If there is no common path or if the path is long, we
+        # just rebuild from scratch.
+
+        # We could probably handle going backwards if we wanted to. For now,
+        # we assume we always go forward.
+        if rev < self.rev:
+            self._populate_full(ctx)
+            return
+
+        between = self.repo.changelog.nodesbetween([self.node], [node])[0]
+
+        # 100 is arbitrary.
+        if not len(between) or len(between) > 100:
+            self._populate_full(ctx)
+            return
+
+        # The first node is always the starting point, which we've already
+        # processed.
+        between.pop(0)
+
+        for node in between:
+            ctx2 = self.repo.changectx(node)
+
+            # Merge commits are hard. We should ideally follow their nodes.
+            # For now, we just bail and do a full population.
+            if len(ctx2.parents()) > 1:
+                self._populate_full(ctx)
+                return
+
+            self._populate_incremental(ctx2)
+
+        self._finish_populating()
+
+    def trees(self, incremental=True):
+        """Obtain all the Git Tree instances we represent.
+
+        This is a generator of 2-tuples of (Tree, path).
+
+        The tuple with path == '' represents the root tree and is what is used
+        for the commit object.
+
+        The default behavior is to only retrieve trees that changed since we
+        last obtained trees. Note that if you call this multiple times without
+        updating the revision, no trees will be returned on subsequent calls.
+        """
+
+        trees = {}
+        children = {}
+
+        # Empty trees are special.
+        if not len(self.dirs):
+            yield (Tree(), '')
+            return
+
+        for tree_path in sorted(self.dirs.keys(), key=len, reverse=True):
+            tree = self.tree_cache.get(tree_path, None)
+
+            if tree is not None:
+                if not incremental:
+                    yield (tree, tree_path)
+
+                continue
+
+            tree = Tree()
+            for entry in self.dirs[tree_path].values():
+                tree.add(entry.path, entry.mode, entry.sha)
+
+            for path, tree_id in children.get(tree_path, {}).iteritems():
+                tree.add(path, stat.S_IFDIR, tree_id)
+
+            # Empty trees can creep in since we don't traverse fully on
+            # deletion. Ignore empty trees.
+            if not len(tree):
+                continue
+
+            parent = os.path.dirname(tree_path)
+            entry = children.get(parent, {})
+            entry[os.path.basename(tree_path)] = tree.id
+            children[parent] = entry
+
+            yield (tree, tree_path)
+            self.tree_cache[tree_path] = tree
+
+    def _populate_full(self, ctx):
+        self.dirs = {}
+        self.tree_cache = {}
+        self.dirty_trees = set()
+
+        for path in ctx.manifest().keys():
+            fctx = ctx[path]
+
+            entry = TreeTracker.tree_entry(fctx)
+
+            d = os.path.dirname(path)
+
+            dir_entry = self.dirs.get(d, {})
+            dir_entry[entry.path] = entry
+            self.dirs[d] = dir_entry
+
+        self.node = ctx.node()
+        self.rev = ctx.rev()
+
+        self._finish_populating()
+
+    def _populate_incremental(self, ctx):
+        for path in sorted(ctx.files(), key=len):
+            d = os.path.dirname(path)
+            self.dirty_trees.add(d)
+
+            try:
+                fctx = ctx[path]
+            # If the file was deleted, remove record of it.
+            except error.LookupError:
+                dir_entry = self.dirs.get(d, None)
+
+                # Directory didn't exist before. This is weird, but OK.
+                if dir_entry is None:
+                    continue
+
+                try:
+                    del dir_entry[os.path.basename(path)]
+                # Directory existed but it didn't have this file. That's
+                # kinda weird, but it's possible on merges.
+                except KeyError:
+                    pass
+
+                self.dirs[d] = dir_entry
+                continue
+
+            # It's possible the path used to be a directory. Blindly delete
+            # any directories having the same name as this.
+            try:
+                del self.dirs[path]
+            except KeyError:
+                pass
+
+            entry = TreeTracker.tree_entry(fctx)
+
+            dir_entry = self.dirs.get(d, {})
+            dir_entry[entry.path] = entry
+            self.dirs[d] = dir_entry
+
+        self.node = ctx.node()
+        self.rev = ctx.rev()
+
+    def _finish_populating(self):
+        """Finished populating state.
+
+        This is called whenever the revision of the tree is updated. For
+        incremental updates, it should only be called once after the final
+        revision has been applied.
+        """
+
+        # Look for missing parent directories and populate them.
+        for d in self.dirs.keys():
+            if d == '':
+                continue
+
+            parent = d
+
+            while True:
+                parent = os.path.dirname(parent)
+
+                entry = self.dirs.get(parent, None)
+                if entry is None:
+                    self.dirs[parent] = {}
+
+                if parent == '':
+                    break
+
+        # Ensure dirty trees dirty their ancestors.
+        for path in [d for d in self.dirty_trees]:
+            if path == '':
+                continue
+
+            parent = path
+
+            while True:
+                parent = os.path.dirname(parent)
+                self.dirty_trees.add(parent)
+
+                if parent == '':
+                    break
+
+        # Wipe out dirty trees from cache.
+        for path in self.dirty_trees:
+            try:
+                del self.tree_cache[path]
+            except KeyError:
+                pass
+
+    @staticmethod
+    def tree_entry(fctx):
+        blob = Blob.from_string(fctx.data())
+
+        flags = fctx.flags()
+
+        if 'l' in flags:
+            mode = 0120000
+        elif 'x' in flags:
+            mode = 0100755
+        else:
+            mode = 0100644
+
+        return TreeEntry(os.path.basename(fctx.path()), mode, blob.id)
+
 
 class GitHandler(object):
     mapfile = 'git-mapfile'
@@ -368,18 +632,58 @@ class GitHandler(object):
         if total:
             self.ui.status(_("exporting hg objects to git\n"))
 
-        self.export_git_blobs(export)
+        tracker = None
 
-        for i, rev in enumerate(export):
-            util.progress(self.ui, 'exporting', i, total=total)
+        i = 0
+        for rev, tree_id in self.export_git_trees(export):
+            i += 1
             ctx = self.repo.changectx(rev)
             state = ctx.extra().get('hg-git', None)
             if state == 'octopus':
-                self.ui.debug("revision %d is a part "
-                              "of octopus explosion\n" % ctx.rev())
+                self.ui.debug("revision %d is a part of octopus"
+                              "explosion\n" % ctx.rev())
                 continue
-            self.export_hg_commit(rev)
+
+            self.export_hg_commit(rev, tree_id)
+            util.progress(self.ui, 'exporting', i, total=total)
+
         util.progress(self.ui, 'importing', None, total=total)
+
+    def export_git_trees(self, changeids=None, incremental=True):
+        """Export git trees for Mercurial nodes.
+
+        This functions takes a set of Mercurial revisions IDs and exports the
+        Git trees for them, including the underlying blobs.
+
+        The default behavior is to export trees for every revision ID. To
+        limit the set of revisions exported, pass an interable of the raw 20
+        byte revision IDs via the changeids argument.
+
+        The default behavior is to intelligently process exports incrementally.
+        This saves us from performing a lot of redundant processing and is much
+        faster. It is typically what is wanted. However, if the repository is
+        corrupted or missing data, you can perform a full export to hopefully
+        repair it.
+        """
+        changeids = changeids or [self.repo.lookup(n) for n in self.repo]
+
+        oldenc = self.swap_out_encoding()
+
+        tracker = TreeTracker(self.repo)
+
+        for rev in changeids:
+            blobs = GitHandler.export_git_blobs_for_revision(self.repo,
+                self.git, rev, incremental)
+
+            tracker.update_revision(rev, incremental)
+
+            for tree, tree_path in tracker.trees():
+                self.git.object_store.add_object(tree)
+
+                if tree_path == '':
+                    yield (rev, tree.id)
+
+        self.swap_out_encoding(oldenc)
 
     def export_git_blobs(self, changeids=None, incremental=True):
         """Export git blobs for Mercurial nodes.
@@ -405,8 +709,10 @@ class GitHandler(object):
         oldenc = self.swap_out_encoding()
 
         for rev in changeids:
-            GitHandler.export_git_blobs_for_revision(self.repo, self.git, rev,
-                incremental)
+            data = GitHandler.export_git_blobs_for_revision(self.repo,
+                self.git, rev, incremental)
+
+            yield (rev, data)
 
         self.swap_out_encoding(oldenc)
 
@@ -449,7 +755,7 @@ class GitHandler(object):
     # convert this commit into git objects
     # go through the manifest, convert all blobs/trees we don't have
     # write the commit object (with metadata info)
-    def export_hg_commit(self, rev):
+    def export_hg_commit(self, rev, tree_sha):
         self.ui.note(_("converting revision %s\n") % hex(rev))
 
         oldenc = self.swap_out_encoding()
@@ -497,7 +803,6 @@ class GitHandler(object):
         if 'encoding' in extra:
             commit.encoding = extra['encoding']
 
-        tree_sha = commit_tree(self.git.object_store, self.iterblobs(ctx))
         commit.tree = tree_sha
 
         self.git.object_store.add_object(commit)
@@ -637,22 +942,6 @@ class GitHandler(object):
             message += "\n--HG--\n" + extra_message
 
         return message
-
-    def iterblobs(self, ctx):
-        for f in ctx:
-            fctx = ctx[f]
-
-            blob = Blob.from_string(fctx.data())
-            self.git.object_store.add_object(blob)
-
-            if 'l' in ctx.flags(f):
-                mode = 0120000
-            elif 'x' in ctx.flags(f):
-                mode = 0100755
-            else:
-                mode = 0100644
-
-            yield f, blob.id, mode
 
     def getnewgitcommits(self, refs=None):
         self.init_if_missing()
