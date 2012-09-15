@@ -70,6 +70,7 @@ class GitProgress(object):
 class GitHandler(object):
     mapfile = 'git-mapfile'
     tagsfile = 'git-tags'
+    versionfile = 'git-state-version'
 
     def __init__(self, dest_repo, ui):
         self.repo = dest_repo
@@ -124,6 +125,20 @@ class GitHandler(object):
     def load_state(self):
         """Load cached state from a previous run into the instance."""
 
+        # We didn't always have a version file. If it isn't present, we
+        # assume version 1.
+        version = None
+        if os.path.exists(self.repo.join(self.versionfile)):
+            version = self.repo.opener.read(self.versionfile)
+
+            try:
+                version = int(version)
+            except ValueError:
+                self.ui.status(_("version file corrupted: not an int\n"))
+                version = 1
+        else:
+            version = 1
+
         # Load the map file.
         self._map_git = {}
         self._map_hg = {}
@@ -157,6 +172,10 @@ class GitHandler(object):
         # atomictempfile no longer has either of rename (pre-1.9) or
         # close (post-1.9)
         getattr(tags_file, 'rename', getattr(tags_file, 'close', None))()
+
+        version_file = self.repo.opener(self.versionfile, 'w', atomictemp=True)
+        version_file.write('1')
+        getattr(version_file, 'rename', getattr(version_file, 'close', None))()
 
     ## END FILE LOAD AND SAVE METHODS
 
