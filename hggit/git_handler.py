@@ -162,6 +162,8 @@ class GitHandler(object):
                 sha, name = line.strip().split(' ', 1)
                 self.tags[name] = sha
 
+        self._migrate_state(version)
+
     def save_state(self):
         map_file = self.repo.opener(self.mapfile, 'w', atomictemp=True)
         for hgsha, gitsha in sorted(self._map_hg.iteritems()):
@@ -181,8 +183,41 @@ class GitHandler(object):
         getattr(tags_file, 'rename', getattr(tags_file, 'close', None))()
 
         version_file = self.repo.opener(self.versionfile, 'w', atomictemp=True)
-        version_file.write('1')
+        version_file.write('2')
         getattr(version_file, 'rename', getattr(version_file, 'close', None))()
+
+    def _migrate_state(self, version):
+        if version == 2:
+            return
+
+        assert version == 1
+
+        self.init_if_missing()
+
+        pruned_map = {}
+
+        # In version 2, we stopped recording the mapping from HG file revision
+        # nodes to Git blob SHAs because they aren't useful. The migration
+        # involves pruning the old entries from the mapping.
+        for blob_id, node in self._map_git.iteritems():
+            try:
+                blob = self.git.object_store[blob_id]
+
+                if isinstance(blob, Blob):
+                    continue
+
+                pruned_map[blob_id] = node
+
+            # We must have failed getting the object from the store. We
+            # definitely don't want it to exist in the mapping if it isn't
+            # available.
+            except Exception:
+                pass
+
+        self._map_git = {}
+        self._map_hg = {}
+        for k, v in pruned_map.iteritems():
+            self.map_set(k, v)
 
     ## END FILE LOAD AND SAVE METHODS
 
@@ -539,13 +574,9 @@ class GitHandler(object):
     def iterblobs(self, ctx):
         for f in ctx:
             fctx = ctx[f]
-            blobid = self.map_git_get(hex(fctx.filenode()))
 
-            if not blobid:
-                blob = Blob.from_string(fctx.data())
-                self.git.object_store.add_object(blob)
-                self.map_set(blob.id, hex(fctx.filenode()))
-                blobid = blob.id
+            blob = Blob.from_string(fctx.data())
+            self.git.object_store.add_object(blob)
 
             if 'l' in ctx.flags(f):
                 mode = 0120000
@@ -554,7 +585,7 @@ class GitHandler(object):
             else:
                 mode = 0100644
 
-            yield f, blobid, mode
+            yield f, blob.id, mode
 
     def getnewgitcommits(self, refs=None):
         self.init_if_missing()
