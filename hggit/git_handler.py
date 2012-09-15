@@ -86,8 +86,7 @@ class GitHandler(object):
 
         self.branch_bookmark_suffix = ui.config('git', 'branch_bookmark_suffix')
 
-        self.load_map()
-        self.load_tags()
+        self.load_state()
 
     # make the git data directory
     def init_if_missing(self):
@@ -122,7 +121,10 @@ class GitHandler(object):
     def map_git_get(self, hgsha):
         return self._map_hg.get(hgsha)
 
-    def load_map(self):
+    def load_state(self):
+        """Load cached state from a previous run into the instance."""
+
+        # Load the map file.
         self._map_git = {}
         self._map_hg = {}
         if os.path.exists(self.repo.join(self.mapfile)):
@@ -131,31 +133,30 @@ class GitHandler(object):
                 self._map_git[gitsha] = hgsha
                 self._map_hg[hgsha] = gitsha
 
-    def save_map(self):
-        file = self.repo.opener(self.mapfile, 'w+', atomictemp=True)
-        for hgsha, gitsha in sorted(self._map_hg.iteritems()):
-            file.write("%s %s\n" % (gitsha, hgsha))
-        # If this complains that NoneType is not callable, then
-        # atomictempfile no longer has either of rename (pre-1.9) or
-        # close (post-1.9)
-        getattr(file, 'rename', getattr(file, 'close', None))()
-
-    def load_tags(self):
+        # Load the tags file.
         self.tags = {}
         if os.path.exists(self.repo.join(self.tagsfile)):
             for line in self.repo.opener(self.tagsfile):
                 sha, name = line.strip().split(' ', 1)
                 self.tags[name] = sha
 
-    def save_tags(self):
-        file = self.repo.opener(self.tagsfile, 'w+', atomictemp=True)
-        for name, sha in sorted(self.tags.iteritems()):
-            if not self.repo.tagtype(name) == 'global':
-                file.write("%s %s\n" % (sha, name))
+    def save_state(self):
+        map_file = self.repo.opener(self.mapfile, 'w', atomictemp=True)
+        for hgsha, gitsha in sorted(self._map_hg.iteritems()):
+            map_file.write("%s %s\n" % (gitsha, hgsha))
         # If this complains that NoneType is not callable, then
         # atomictempfile no longer has either of rename (pre-1.9) or
         # close (post-1.9)
-        getattr(file, 'rename', getattr(file, 'close', None))()
+        getattr(map_file, 'rename', getattr(map_file, 'close', None))()
+
+        tags_file = self.repo.opener(self.tagsfile, 'w', atomictemp=True)
+        for name, sha in sorted(self.tags.iteritems()):
+            if not self.repo.tagtype(name) == 'global':
+                tags_file.write("%s %s\n" % (sha, name))
+        # If this complains that NoneType is not callable, then
+        # atomictempfile no longer has either of rename (pre-1.9) or
+        # close (post-1.9)
+        getattr(tags_file, 'rename', getattr(tags_file, 'close', None))()
 
     ## END FILE LOAD AND SAVE METHODS
 
@@ -164,7 +165,7 @@ class GitHandler(object):
     def import_commits(self, remote_name):
         self.import_git_objects(remote_name)
         self.update_hg_bookmarks(self.git.get_refs())
-        self.save_map()
+        self.save_state()
 
     def fetch(self, remote, heads):
         self.export_commits()
@@ -199,7 +200,7 @@ class GitHandler(object):
         if not modheads:
             self.ui.status(_("no changes found\n"))
 
-        self.save_map()
+        self.save_state()
 
         return len(modheads)
 
@@ -209,7 +210,7 @@ class GitHandler(object):
             self.export_hg_tags()
             self.update_references()
         finally:
-            self.save_map()
+            self.save_state()
 
     def get_refs(self, remote):
         self.export_commits()
@@ -979,7 +980,7 @@ class GitHandler(object):
                             sha = self.map_hg_get(obj_sha)
                             # TODO: better handling for annotated tags
                             self.tags[ref_name] = sha
-        self.save_tags()
+        self.save_state()
 
     def update_hg_bookmarks(self, refs):
         try:
