@@ -367,6 +367,9 @@ class GitHandler(object):
         total = len(export)
         if total:
             self.ui.status(_("exporting hg objects to git\n"))
+
+        self.export_git_blobs(export)
+
         for i, rev in enumerate(export):
             util.progress(self.ui, 'exporting', i, total=total)
             ctx = self.repo.changectx(rev)
@@ -378,6 +381,70 @@ class GitHandler(object):
             self.export_hg_commit(rev)
         util.progress(self.ui, 'importing', None, total=total)
 
+    def export_git_blobs(self, changeids=None, incremental=True):
+        """Export git blobs for Mercurial nodes.
+
+        This function takes a set of Mercurial revision IDs and exports the
+        Git blobs for them.
+
+        The default behavior is to export blobs for every revision ID. To
+        limit the set of revisions exported, pass an iterable of the raw 20
+        byte revision IDs via the changeids argument.
+
+        The default behavior is also to intelligently export only the
+        changed files. The function assumes that if a file did not change
+        then the blob has already been exported or will be exported via
+        another revision. This is typically fine and it prevents us from
+        doing redundant work.
+
+        There is no harm to redundantly exporting git blobs aside from
+        performance losses.
+        """
+        changeids = changeids or [self.repo.lookup(n) for n in self.repo]
+
+        oldenc = self.swap_out_encoding()
+
+        for rev in changeids:
+            GitHandler.export_git_blobs_for_revision(self.repo, self.git, rev,
+                incremental)
+
+        self.swap_out_encoding(oldenc)
+
+    @staticmethod
+    def export_git_blobs_for_revision(hgrepo, gitrepo, rev, incremental=True):
+        """Export Git blobs for a specific HG revision ID.
+
+        This takes an HG repo, a Git repo, a revision ID, and a flag saying
+        whether to perform incremental export. If incremental is True (the
+        default), only changed files will be exported.
+
+        The return value is a mapping of filenames to the hex representation
+        of the blob's SHA-1. If operating in incremental mode, only the changed
+        filenames will be present in the mapping. If the file was deleted, its
+        SHA-1 will be None.
+        """
+        ctx = hgrepo.changectx(rev)
+
+        files = ctx.files() if incremental else ctx.manifest.keys()
+
+        result = {}
+
+        for filename in files:
+            try:
+                fctx = ctx[filename]
+
+            # This happens if in incremental mode and the change was a
+            # deletion. Obviously this means there is nothing to export.
+            except error.LookupError:
+                assert incremental
+                result[filename] = None
+                continue
+
+            blob = Blob.from_string(fctx.data())
+            gitrepo.object_store.add_object(blob)
+            result[filename] = blob.id
+
+        return result
 
     # convert this commit into git objects
     # go through the manifest, convert all blobs/trees we don't have
