@@ -125,6 +125,16 @@ class GitHandler(object):
     def load_state(self):
         """Load cached state from a previous run into the instance."""
 
+        self._map_git = {}
+        self._map_hg = {}
+        self.tags = {}
+
+        # If there is no Git repo, this invalidates assertions about what's
+        # already stored in the repo. So, don't load any saved state.
+        # Essentially, this clears all stored state.
+        if not os.path.exists(self.gitdir):
+            return
+
         # We didn't always have a version file. If it isn't present, we
         # assume version 1.
         version = None
@@ -140,8 +150,6 @@ class GitHandler(object):
             version = 1
 
         # Load the map file.
-        self._map_git = {}
-        self._map_hg = {}
         if os.path.exists(self.repo.join(self.mapfile)):
             for line in self.repo.opener(self.mapfile):
                 gitsha, hgsha = line.strip().split(' ', 1)
@@ -149,7 +157,6 @@ class GitHandler(object):
                 self._map_hg[hgsha] = gitsha
 
         # Load the tags file.
-        self.tags = {}
         if os.path.exists(self.repo.join(self.tagsfile)):
             for line in self.repo.opener(self.tagsfile):
                 sha, name = line.strip().split(' ', 1)
