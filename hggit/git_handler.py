@@ -1,4 +1,5 @@
-import os, math, multiprocessing, random, urllib, re, stat, time
+import os, math, multiprocessing, random, urllib, re, stat, sys, time, gc
+import itertools, signal
 
 from dulwich.errors import HangupException, GitProtocolError
 from dulwich.index import commit_tree
@@ -74,16 +75,32 @@ def robust_add_object(git, obj):
 
             raise e
 
-def process_git_export(config, hgpath, rev, gitdir, incremental=True):
+def process_git_export(config, hgpath, gitdir, incremental, jobs, results):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    try:
+        git = Repo(gitdir)
+        ui = hgui()
+        for section, name, value in config:
+            ui.setconfig(section, name, value)
+
+        hg = hgrepository(ui, hgpath)
+
+        while True:
+            revs = jobs.get()
+
+            for rev in revs:
+                results.put(_process_git_export(hg, git, rev, incremental))
+
+            # Our worker process has a tendency to use a lot of memory before
+            # GC. We force a GC to keep things in check.
+            gc.collect()
+
+    except Exception:
+        sys.exit(1)
+
+def _process_git_export(hg, git, rev, incremental):
     global tree_tracker
-
-    git = Repo(gitdir)
-    ui = hgui()
-
-    for section, name, value in config:
-        ui.setconfig(section, name, value)
-
-    hg = hgrepository(ui, hgpath)
 
     if tree_tracker is None:
         tree_tracker = TreeTracker(hg)
@@ -708,22 +725,25 @@ class GitHandler(object):
 
         tracker = None
 
-        i = 0
-        for rev, tree_id in self.export_git_trees(export):
-            i += 1
+        i = [0]
+        def on_tree(rev, tree_id):
+            i[0] += 1
             ctx = self.repo.changectx(rev)
+
             state = ctx.extra().get('hg-git', None)
             if state == 'octopus':
                 self.ui.debug("revision %d is a part of octopus"
                               "explosion\n" % ctx.rev())
-                continue
+                return
 
             self.export_hg_commit(rev, tree_id)
-            util.progress(self.ui, 'exporting', i, total=total)
+            util.progress(self.ui, 'exporting', i[0], total=total)
 
+
+        self.export_git_trees(on_tree, export)
         util.progress(self.ui, 'importing', None, total=total)
 
-    def export_git_trees(self, changeids=None, incremental=True):
+    def export_git_trees(self, cb, changeids=None, incremental=True):
         """Export git trees for Mercurial nodes.
 
         This functions takes a set of Mercurial revisions IDs and exports the
@@ -739,24 +759,75 @@ class GitHandler(object):
         corrupted or missing data, you can perform a full export to hopefully
         repair it.
         """
-        changeids = changeids or [self.repo.lookup(n) for n in self.repo]
+        if changeids is None:
+            changeids = [self.repo.lookup(n) for n in self.repo]
 
         oldenc = self.swap_out_encoding()
 
         config = list(self.ui.walkconfig())
-        pool = multiprocessing.Pool()
 
-        results = [pool.apply_async(process_git_export,
-            [config, self.repo.root, rev, self.git.path, incremental])
-            for rev in changeids]
+        job_queue = multiprocessing.Queue()
+        result_queue = multiprocessing.Queue()
 
-        for result in results:
-            rev, root_id = result.get()
+        workers = []
+        for i in range(multiprocessing.cpu_count()):
+            worker = multiprocessing.Process(target=process_git_export,
+                args=[config, self.repo.root, self.git.path, incremental,
+                    job_queue, result_queue])
+            worker.start()
 
-            yield (rev, root_id)
+            workers.append(worker)
 
-        pool.close()
-        pool.join()
+        # We specifically distribute work to make worker efficiency better.
+        # We first start by splitting the changeids into large chunks. These
+        # represent "stages" for export. We subdivide each stage into
+        # consecutive blocks and feed these into the workers. This makes it so
+        # workers process changesets near to each other (assuming linear
+        # export, which it typically is). This prevents workers from performing
+        # redundant work when updating TreeTracker since they should only be
+        # traversing a single node rather than multiple. For large
+        # repositories, this translates to a huge performance win.
+        batch_size = 100 * len(workers)
+
+        batches = [changeids[i:i+batch_size] for i in range(0, len(changeids),
+            batch_size)]
+
+        try:
+            for batch in batches:
+                chain = itertools.chain(batch, itertools.repeat(None, 99))
+                chunks = zip(*[chain]*100)
+
+                for chunk in chunks:
+                    job_queue.put(chunk)
+
+                pending = [rev for rev in batch]
+                finished = {}
+
+                while len(pending):
+                    # If we have the result we're waiting for, process it
+                    # immediately.
+                    if pending[0] in finished:
+                        cb(pending[0], finished[pending[0]])
+                        pending.pop(0)
+                        continue
+
+                    # Else wait for it to come in.
+                    rev, root_id = result_queue.get()
+                    finished[rev] = root_id
+
+            for worker in workers:
+                worker.join()
+
+        except KeyboardInterrupt:
+            for worker in workers:
+                worker.terminate()
+                worker.join()
+        finally:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.terminate()
+
+                worker.join()
 
     def export_git_blobs(self, changeids=None, incremental=True):
         """Export git blobs for Mercurial nodes.
