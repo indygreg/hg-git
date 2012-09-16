@@ -2,8 +2,8 @@ import os, math, urllib, re, stat, sys
 
 from dulwich.errors import HangupException, GitProtocolError
 from dulwich.index import commit_tree
-from dulwich.objects import Blob, Commit, Tag, Tree, parse_timezone
-from dulwich.pack import create_delta, apply_delta
+from dulwich.objects import Blob, Commit, Tag, Tree
+from dulwich.pack import create_delta
 from dulwich.repo import Repo
 from dulwich import client
 
@@ -371,6 +371,9 @@ class GitHandler(object):
         if total:
             self.ui.status(_("exporting hg objects to git\n"))
 
+        exporter = gitexporter.MercurialToGitConverter(self.repo, self.git,
+            author_map=self.author_map, id_map=self._map_hg)
+
         i = [0]
         def on_tree(rev, tree_id):
             i[0] += 1
@@ -382,204 +385,13 @@ class GitHandler(object):
                               "explosion\n" % ctx.rev())
                 return
 
-            self.export_hg_commit(rev, tree_id)
+            self.ui.note(_("converting revision %s\n") % hex(rev))
+            exporter.export_commit_object(ctx, tree_id)
             util.progress(self.ui, 'exporting', i[0], total=total)
 
-        exporter = gitexporter.MercurialToGitConverter(self.repo, self.git)
         exporter.export_trees(changeids=export, cb=on_tree)
 
         util.progress(self.ui, 'importing', None, total=total)
-
-    # convert this commit into git objects
-    # go through the manifest, convert all blobs/trees we don't have
-    # write the commit object (with metadata info)
-    def export_hg_commit(self, rev, tree_sha):
-        self.ui.note(_("converting revision %s\n") % hex(rev))
-
-        oldenc = self.swap_out_encoding()
-
-        ctx = self.repo.changectx(rev)
-        extra = ctx.extra()
-
-        commit = Commit()
-
-        (time, timezone) = ctx.date()
-        commit.author = self.get_git_author(ctx)
-        commit.author_time = int(time)
-        commit.author_timezone = -timezone
-
-        if 'committer' in extra:
-            # fixup timezone
-            (name, timestamp, timezone) = extra['committer'].rsplit(' ', 2)
-            commit.committer = name
-            commit.commit_time = timestamp
-
-            # work around a timezone format change
-            if int(timezone) % 60 != 0: #pragma: no cover
-                timezone = parse_timezone(timezone)
-                # Newer versions of Dulwich return a tuple here
-                if isinstance(timezone, tuple):
-                    timezone, neg_utc = timezone
-                    commit._commit_timezone_neg_utc = neg_utc
-            else:
-                timezone = -int(timezone)
-            commit.commit_timezone = timezone
-        else:
-            commit.committer = commit.author
-            commit.commit_time = commit.author_time
-            commit.commit_timezone = commit.author_timezone
-
-        commit.parents = []
-        for parent in self.get_git_parents(ctx):
-            hgsha = hex(parent.node())
-            git_sha = self.map_git_get(hgsha)
-            if git_sha:
-                commit.parents.append(git_sha)
-
-        commit.message = self.get_git_message(ctx)
-
-        if 'encoding' in extra:
-            commit.encoding = extra['encoding']
-
-        commit.tree = tree_sha
-
-        self.git.object_store.add_object(commit)
-        self.map_set(commit.id, ctx.hex())
-
-        self.swap_out_encoding(oldenc)
-        return commit.id
-
-    def get_valid_git_username_email(self, name):
-        r"""Sanitize usernames and emails to fit git's restrictions.
-
-        The following is taken from the man page of git's fast-import
-        command:
-
-            [...] Likewise LF means one (and only one) linefeed [...]
-
-            committer
-                The committer command indicates who made this commit,
-                and when they made it.
-
-                Here <name> is the person's display name (for example
-                "Com M Itter") and <email> is the person's email address
-                ("cm@example.com[1]"). LT and GT are the literal
-                less-than (\x3c) and greater-than (\x3e) symbols. These
-                are required to delimit the email address from the other
-                fields in the line. Note that <name> and <email> are
-                free-form and may contain any sequence of bytes, except
-                LT, GT and LF. <name> is typically UTF-8 encoded.
-
-        Accordingly, this function makes sure that there are none of the
-        characters <, >, or \n in any string which will be used for
-        a git username or email. Before this, it first removes left
-        angle brackets and spaces from the beginning, and right angle
-        brackets and spaces from the end, of this string, to convert
-        such things as " <john@doe.com> " to "john@doe.com" for
-        convenience.
-
-        TESTS:
-
-        >>> from mercurial.ui import ui
-        >>> g = GitHandler('', ui()).get_valid_git_username_email
-        >>> g('John Doe')
-        'John Doe'
-        >>> g('john@doe.com')
-        'john@doe.com'
-        >>> g(' <john@doe.com> ')
-        'john@doe.com'
-        >>> g('    <random<\n<garbage\n>  > > ')
-        'random???garbage?'
-        >>> g('Typo in hgrc >but.hg-git@handles.it.gracefully>')
-        'Typo in hgrc ?but.hg-git@handles.it.gracefully'
-        """
-        return re.sub('[<>\n]', '?', name.lstrip('< ').rstrip('> '))
-
-    def get_git_author(self, ctx):
-        # hg authors might not have emails
-        author = ctx.user()
-
-        # see if a translation exists
-        if author in self.author_map:
-            author = self.author_map[author]
-
-        # check for git author pattern compliance
-        regex = re.compile('^(.*?) ?\<(.*?)(?:\>(.*))?$')
-        a = regex.match(author)
-
-        if a:
-            name = self.get_valid_git_username_email(a.group(1))
-            email = self.get_valid_git_username_email(a.group(2))
-            if a.group(3) != None and len(a.group(3)) != 0:
-                name += ' ext:(' + urllib.quote(a.group(3)) + ')'
-            author = self.get_valid_git_username_email(name) + ' <' + self.get_valid_git_username_email(email) + '>'
-        elif '@' in author:
-            author = self.get_valid_git_username_email(author) + ' <' + self.get_valid_git_username_email(author) + '>'
-        else:
-            author = self.get_valid_git_username_email(author) + ' <none@none>'
-
-        if 'author' in ctx.extra():
-            author = "".join(apply_delta(author, ctx.extra()['author']))
-
-        return author
-
-    def get_git_parents(self, ctx):
-        def is_octopus_part(ctx):
-            return ctx.extra().get('hg-git', None) in ('octopus', 'octopus-done')
-
-        parents = []
-        if ctx.extra().get('hg-git', None) == 'octopus-done':
-            # implode octopus parents
-            part = ctx
-            while is_octopus_part(part):
-                (p1, p2) = part.parents()
-                assert not is_octopus_part(p1)
-                parents.append(p1)
-                part = p2
-            parents.append(p2)
-        else:
-            parents = ctx.parents()
-
-        return parents
-
-    def get_git_message(self, ctx):
-        extra = ctx.extra()
-
-        message = ctx.description() + "\n"
-        if 'message' in extra:
-            message = "".join(apply_delta(message, extra['message']))
-
-        # HG EXTRA INFORMATION
-        add_extras = False
-        extra_message = ''
-        if not ctx.branch() == 'default':
-            add_extras = True
-            extra_message += "branch : " + ctx.branch() + "\n"
-
-        renames = []
-        for f in ctx.files():
-            if f not in ctx.manifest():
-                continue
-            rename = ctx.filectx(f).renamed()
-            if rename:
-                renames.append((rename[0], f))
-
-        if renames:
-            add_extras = True
-            for oldfile, newfile in renames:
-                extra_message += "rename : " + oldfile + " => " + newfile + "\n"
-
-        for key, value in extra.iteritems():
-            if key in ('author', 'committer', 'encoding', 'message', 'branch', 'hg-git'):
-                continue
-            else:
-                add_extras = True
-                extra_message += "extra : " + key + " : " +  urllib.quote(value) + "\n"
-
-        if add_extras:
-            message += "\n--HG--\n" + extra_message
-
-        return message
 
     def getnewgitcommits(self, refs=None):
         self.init_if_missing()
