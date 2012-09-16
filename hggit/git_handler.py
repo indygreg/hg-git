@@ -701,7 +701,7 @@ class GitHandler(object):
         self.init_if_missing()
 
         nodes = [self.repo.lookup(n) for n in self.repo]
-        export = [node for node in nodes if not hex(node) in self._map_hg]
+        export = [node for node in nodes if hex(node) not in self._map_hg]
         total = len(export)
         if total:
             self.ui.status(_("exporting hg objects to git\n"))
