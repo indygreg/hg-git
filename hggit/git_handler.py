@@ -1,5 +1,6 @@
 import os, math, multiprocessing, random, urllib, re, stat, sys, time, gc
 import itertools, signal
+import Queue
 
 from dulwich.errors import HangupException, GitProtocolError
 from dulwich.index import commit_tree
@@ -75,7 +76,15 @@ def robust_add_object(git, obj):
 
             raise e
 
-def process_git_export(config, hgpath, gitdir, incremental, jobs, results):
+def pack_loose_objects(gitdir, interval, alive):
+    git = Repo(gitdir)
+
+    while alive.value == 1:
+        time.sleep(interval)
+        git.object_store.pack_loose_objects()
+
+def process_git_export(config, hgpath, gitdir, incremental, jobs, results,
+        alive):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     try:
@@ -86,11 +95,16 @@ def process_git_export(config, hgpath, gitdir, incremental, jobs, results):
 
         hg = hgrepository(ui, hgpath)
 
-        while True:
+        while alive.value == 1:
             revs = jobs.get()
 
             for rev in revs:
+                if rev is None:
+                    continue
+
                 results.put(_process_git_export(hg, git, rev, incremental))
+
+            results.put('STARVED')
 
             # Our worker process has a tendency to use a lot of memory before
             # GC. We force a GC to keep things in check.
@@ -723,8 +737,6 @@ class GitHandler(object):
         if total:
             self.ui.status(_("exporting hg objects to git\n"))
 
-        tracker = None
-
         i = [0]
         def on_tree(rev, tree_id):
             i[0] += 1
@@ -738,7 +750,6 @@ class GitHandler(object):
 
             self.export_hg_commit(rev, tree_id)
             util.progress(self.ui, 'exporting', i[0], total=total)
-
 
         self.export_git_trees(on_tree, export)
         util.progress(self.ui, 'importing', None, total=total)
@@ -768,12 +779,21 @@ class GitHandler(object):
 
         job_queue = multiprocessing.Queue()
         result_queue = multiprocessing.Queue()
+        alive = multiprocessing.Value('i', 1)
+
+        # We create a background process that performs periodic packing. It
+        # appears packing is thread safe. This needs to be on a background
+        # thread because packing is CPU intensive and it would block other
+        # cores from doing work.
+        packer = multiprocessing.Process(target=pack_loose_objects,
+            args=[self.git.path, 60, alive])
+        packer.start()
 
         workers = []
         for i in range(multiprocessing.cpu_count()):
             worker = multiprocessing.Process(target=process_git_export,
                 args=[config, self.repo.root, self.git.path, incremental,
-                    job_queue, result_queue])
+                    job_queue, result_queue, alive])
             worker.start()
 
             workers.append(worker)
@@ -787,6 +807,14 @@ class GitHandler(object):
         # redundant work when updating TreeTracker since they should only be
         # traversing a single node rather than multiple. For large
         # repositories, this translates to a huge performance win.
+        #
+        # This strategy creates a new problem: starved workers. It's highly
+        # likely that some workers finish their work before others. When a
+        # worker finishes its work, it sends a "starved" message in the result
+        # queue. If we see one of these messages, we fire off a small batch of
+        # uncompleted work. The starved worker picks it up and processes it. If
+        # it finishes before the original worker, great. If not, we performed
+        # some redundant work. But, at least cores weren't sitting idly.
         batch_size = 100 * len(workers)
 
         batches = [changeids[i:i+batch_size] for i in range(0, len(changeids),
@@ -802,6 +830,8 @@ class GitHandler(object):
 
                 pending = [rev for rev in batch]
                 finished = {}
+                reissued = set()
+                starved_count = 0
 
                 while len(pending):
                     # If we have the result we're waiting for, process it
@@ -811,23 +841,82 @@ class GitHandler(object):
                         pending.pop(0)
                         continue
 
-                    # Else wait for it to come in.
-                    rev, root_id = result_queue.get()
-                    finished[rev] = root_id
+                    # We must have pending results, so we wait for something.
+                    results = []
+                    try:
+                        while True:
+                            results.append(result_queue.get(True, 0.25))
+
+                    except Queue.Empty:
+                        pass
+
+                    have_results = False
+                    for result in results:
+                        if result == 'STARVED':
+                            starved_count += 1
+                        else:
+                            finished[result[0]] = result[1]
+                            have_results = True
+
+                    # If we got results, process them immediately.
+                    if have_results:
+                        continue
+
+                    # If we have no starved workers, there's nothing to do,
+                    # obviously. If we are near the end of the pending queue,
+                    # we don't bother since that would risk us being the long
+                    # pole.
+                    if not starved_count or len(pending) < 5:
+                        continue
+
+                    chunk = []
+                    for i, rev in enumerate(pending):
+                        # Skip the one we are immediately waiting on
+                        # (assume the other work will eventually finish it)
+                        # and skip work we already have.
+                        if i == 0 or rev in finished or rev in reissued:
+                            continue
+
+                        chunk.append(rev)
+                        reissued.add(rev)
+
+                        if len(chunk) == 3:
+                            break
+
+                    # Don't bother issuing if we don't have enough data to
+                    # reissue. The overhead for calculating the new tree
+                    # probably isn't worth it.
+                    if len(chunk) < 3:
+                        continue
+
+                    job_queue.put(chunk)
+                    starved_count -= 1
+                    print 'Satisfying starved worker.'
+
+            alive.value = 0
 
             for worker in workers:
                 worker.join()
 
+            packer.join()
+
         except KeyboardInterrupt:
+            alive.value = 0
+
             for worker in workers:
                 worker.terminate()
                 worker.join()
+
+            packer.terminate()
         finally:
+            alive.value = 0
             for worker in workers:
                 if worker.is_alive():
                     worker.terminate()
 
                 worker.join()
+
+            packer.join()
 
     def export_git_blobs(self, changeids=None, incremental=True):
         """Export git blobs for Mercurial nodes.
