@@ -386,7 +386,8 @@ class GitHandler(object):
                 return
 
             self.ui.note(_("converting revision %s\n") % hex(rev))
-            exporter.export_commit_object(ctx, tree_id)
+            gitexporter.MercurialToGitConverter.export_commit_object(ctx,
+                self.git, tree_id, self.author_map, self._map_hg)
             util.progress(self.ui, 'exporting', i[0], total=total)
 
         exporter.export_trees(changeids=export, cb=on_tree)

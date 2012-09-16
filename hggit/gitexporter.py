@@ -309,62 +309,6 @@ class MercurialToGitConverter(object):
         self.author_map = author_map or {}
         self.id_map = id_map or {}
 
-    def export_commit_object(self, ctx, tree_sha):
-        """Export a commit object for a specific changeset.
-
-        This takes a changectx and a tree hash and writes out the Git commit
-        object.
-        """
-        extra = ctx.extra()
-
-        commit = Commit()
-
-        (time, timezone) = ctx.date()
-        commit.author = self.get_git_author(ctx)
-        commit.author_time = int(time)
-        commit.author_timezone = -timezone
-
-        if 'committer' in extra:
-            # Adjust timezone.
-            name, timestamp, timezone = extra['committer'].rsplit(' ', 2)
-            commit.committer = name
-            commit.commit_time = timestamp
-
-            # Work around a timezone format change.
-            if int(timezone) % 60 != 0: #pragma: no cover
-                timezone = parse_timezone(timezone)
-
-                # Newer versions of Dulwich return a tuple here.
-                if isinstance(timezone, tuple):
-                    timezone, neg_utc = timezone
-                    commit._commit_timezone_neg_utc = neg_utc
-
-            else:
-                timezone = -int(timezone)
-
-            commit.commit_timezone = timezone
-        else:
-            commit.committer = commit.author
-            commit.commit_time = commit.author_time
-            commit.commit_timezone = commit.author_timezone
-
-        commit.parents = []
-        for parent in MercurialToGitConverter.get_git_parents(ctx):
-            hg_sha = parent.hex()
-            git_sha = self.id_map.get(hg_sha, None)
-
-            if git_sha is not None:
-                commit.parents.append(git_sha)
-
-        commit.message = MercurialToGitConverter.get_git_message(ctx)
-
-        if 'encoding' in extra:
-            commit.encoding = extra['encoding']
-
-        commit.tree = tree_sha
-        MercurialToGitConverter.robust_add_object(self.git, commit)
-        self.id_map[ctx.hex()] = commit.id
-
     def export_trees(self, changeids=None, incremental=True, cb=None,
             auto_pack=True, auto_pack_interval=60,
             worker_pool_size=multiprocessing.cpu_count(),
@@ -589,14 +533,15 @@ class MercurialToGitConverter(object):
             if packer is not None:
                 packer.join()
 
-    def get_git_author(self, ctx):
+    @staticmethod
+    def get_git_author(ctx, author_map):
         """Obtain the Git author string for a changeset."""
         hg_author = ctx.user()
 
-        author = self.author_map.get(hg_author, hg_author)
+        author = author_map.get(hg_author, hg_author)
 
         # Check for git author pattern compliance.
-        a = self.RE_GIT_AUTHOR.match(author)
+        a = MercurialToGitConverter.RE_GIT_AUTHOR.match(author)
 
         get_valid = MercurialToGitConverter.get_valid_git_username_email
 
@@ -726,6 +671,63 @@ class MercurialToGitConverter(object):
             message += '\n--HG--\n' + extra_message
 
         return message
+
+    @staticmethod
+    def export_commit_object(ctx, git, tree_sha, author_map, id_map):
+        """Export a commit object for a specific changeset.
+
+        This takes a changectx and a tree hash and writes out the Git commit
+        object.
+        """
+        extra = ctx.extra()
+
+        commit = Commit()
+
+        (time, timezone) = ctx.date()
+        commit.author = MercurialToGitConverter.get_git_author(ctx, author_map)
+        commit.author_time = int(time)
+        commit.author_timezone = -timezone
+
+        if 'committer' in extra:
+            # Adjust timezone.
+            name, timestamp, timezone = extra['committer'].rsplit(' ', 2)
+            commit.committer = name
+            commit.commit_time = timestamp
+
+            # Work around a timezone format change.
+            if int(timezone) % 60 != 0: #pragma: no cover
+                timezone = parse_timezone(timezone)
+
+                # Newer versions of Dulwich return a tuple here.
+                if isinstance(timezone, tuple):
+                    timezone, neg_utc = timezone
+                    commit._commit_timezone_neg_utc = neg_utc
+
+            else:
+                timezone = -int(timezone)
+
+            commit.commit_timezone = timezone
+        else:
+            commit.committer = commit.author
+            commit.commit_time = commit.author_time
+            commit.commit_timezone = commit.author_timezone
+
+        commit.parents = []
+        for parent in MercurialToGitConverter.get_git_parents(ctx):
+            hg_sha = parent.hex()
+            git_sha = id_map.get(hg_sha, None)
+
+            if git_sha is not None:
+                commit.parents.append(git_sha)
+
+        commit.message = MercurialToGitConverter.get_git_message(ctx)
+
+        if 'encoding' in extra:
+            commit.encoding = extra['encoding']
+
+        commit.tree = tree_sha
+        MercurialToGitConverter.robust_add_object(git, commit)
+        id_map[ctx.hex()] = commit.id
 
     @staticmethod
     def export_tree(ctx, git, tracker, incremental=True):
