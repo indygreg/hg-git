@@ -1,4 +1,4 @@
-import os, math, urllib, re, stat
+import os, math, multiprocessing, random, urllib, re, stat, time
 
 from dulwich.errors import HangupException, GitProtocolError
 from dulwich.index import commit_tree
@@ -22,10 +22,84 @@ from mercurial.i18n import _
 from mercurial.node import hex, bin, nullid
 from mercurial import context, util as hgutil
 from mercurial import error
+from mercurial.hg import repository as hgrepository
+from mercurial.ui import ui as hgui
 
 import _ssh
 import util
 from overlay import overlayrepo
+
+tree_tracker = None
+
+def robust_add_object(git, obj):
+    """Robustly add an object to a Git repository.
+
+     There are race conditions between different processes when writing objects
+     to a Git repo. The underlying problem is that dulwich is obtaining an
+     exclusive lock every time it writes an object file.
+
+     If theory, we should be able to ignore the error and rely on the lock
+     owner to finish the write. Unfortunately, we can't just steam ahead
+     because as part of writing Tree objects, dulwich verifies that all
+     referenced objects in the Tree are present. So, this introduces another
+     race condition that must be avoided.
+
+     We work around this ugly mess by attempting writes into the Git repo until
+     it works without locking issues. This results in redundant work when there
+     is a contention issue, but that's unavoidable.
+
+     There is also a bug in dulwich locking mechanism. Essentially, it doesn't
+     do things atomically. It's not only possible for dulwich to raise when
+     trying to obtain the exclusive lock on the lock file, but it can also fail
+     when attempting to perform a rename as part of releasing the lock.
+
+     When we encounter a locking issue, we sleep for a random amount of time
+     and then try again. The sleep is here to reduce the possibility that the
+     two processes will continuously trigger locking issues. It isn't perfect
+     but it does get the job done.
+
+     We could possibly work around this bug
+    """
+    while True:
+        try:
+            git.object_store.add_object(obj)
+            return
+        except OSError as e:
+            # 17 is for obtaining the exclusive lock. 2 is the bug on releasing
+            # it.
+            if e.errno in (2, 17):
+                ms = random.randint(100, 1000)
+                time.sleep(ms / 1000.0)
+                continue
+
+            raise e
+
+def process_git_export(config, hgpath, rev, gitdir, incremental=True):
+    global tree_tracker
+
+    git = Repo(gitdir)
+    ui = hgui()
+
+    for section, name, value in config:
+        ui.setconfig(section, name, value)
+
+    hg = hgrepository(ui, hgpath)
+
+    if tree_tracker is None:
+        tree_tracker = TreeTracker(hg)
+
+    blobs = GitHandler.export_git_blobs_for_revision(hg, git, rev,
+        incremental)
+    tree_tracker.update_revision(rev, incremental)
+
+    root_id = None
+
+    for tree, tree_path in tree_tracker.trees():
+        robust_add_object(git, tree)
+        if tree_path == '':
+            root_id = tree.id
+
+    return (rev, root_id)
 
 class GitProgress(object):
     """convert git server progress strings into mercurial progress"""
@@ -669,21 +743,20 @@ class GitHandler(object):
 
         oldenc = self.swap_out_encoding()
 
-        tracker = TreeTracker(self.repo)
+        config = list(self.ui.walkconfig())
+        pool = multiprocessing.Pool()
 
-        for rev in changeids:
-            blobs = GitHandler.export_git_blobs_for_revision(self.repo,
-                self.git, rev, incremental)
+        results = [pool.apply_async(process_git_export,
+            [config, self.repo.root, rev, self.git.path, incremental])
+            for rev in changeids]
 
-            tracker.update_revision(rev, incremental)
+        for result in results:
+            rev, root_id = result.get()
 
-            for tree, tree_path in tracker.trees():
-                self.git.object_store.add_object(tree)
+            yield (rev, root_id)
 
-                if tree_path == '':
-                    yield (rev, tree.id)
-
-        self.swap_out_encoding(oldenc)
+        pool.close()
+        pool.join()
 
     def export_git_blobs(self, changeids=None, incremental=True):
         """Export git blobs for Mercurial nodes.
@@ -747,7 +820,7 @@ class GitHandler(object):
                 continue
 
             blob = Blob.from_string(fctx.data())
-            gitrepo.object_store.add_object(blob)
+            robust_add_object(gitrepo, blob)
             result[filename] = blob.id
 
         return result
