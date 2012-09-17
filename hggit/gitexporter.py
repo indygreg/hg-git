@@ -2,15 +2,17 @@
 # repositories. It is written as a generic library, suitable for use in any
 # context, including outside of a Mercurial command.
 
+import gc
 import logging
 import multiprocessing
-import os
 import Queue
+import os
 import random
 import re
 import signal
 import stat
 import time
+import urllib
 
 from itertools import chain
 from itertools import repeat
@@ -94,8 +96,8 @@ class TreeTracker(object):
 
         between = self.repo.changelog.nodesbetween([self.node], [node])[0]
 
-        # 100 is arbitrary.
-        if not len(between) or len(between) > 100:
+        # The distance is arbitrary.
+        if not len(between) or len(between) > 25:
             self._populate_full(ctx)
             return
 
@@ -309,10 +311,79 @@ class MercurialToGitConverter(object):
         self.author_map = author_map or {}
         self.id_map = id_map or {}
 
+    def export_changesets(self, cb=None, **kwargs):
+        """Export Mercurial changesets to Git.
+
+        This takes care of exporting blobs, trees, and commits to Git.
+
+        If you are looking to export a repository to Git, this is one of the
+        most important functions as it is what transfers the bulk of the data.
+        """
+
+        # We use export_trees() and its background workers to do as much work
+        # in parallel as possible. We additionally have a background process
+        # churning through commits. The reason we have a background process is
+        # that commit processing can be expensive and we don't want to let this
+        # block the tree workers from moving as fast as possible.
+
+        job_queue = multiprocessing.Queue()
+        result_queue = multiprocessing.Queue()
+
+        config = list(self.hg.ui.walkconfig())
+
+        worker = multiprocessing.Process(
+            target=MercurialToGitConverter._process_commits,
+            name='commit-processor',
+            args=(config, self.hg.root, self.git.path, self.author_map,
+                self.id_map, job_queue, result_queue))
+        worker.start()
+
+        # Pulling items off of result_queue is suboptimally implemented.
+        # But, it's not a huge deal: it just delays the firing of the commit
+        # callback.
+
+        def on_tree(rev, tree_id):
+            job_queue.put(('TREE', (rev, tree_id)))
+
+            results = []
+            try:
+                while True:
+                    results.append(result_queue.get(False))
+            except Queue.Empty:
+                pass
+
+            for action, data in results:
+                assert action == 'COMMIT'
+
+                finished_rev, finished_tree_id, finished_commit_id = data
+                ctx = self.hg.changectx(rev)
+
+                self.id_map[ctx.hex()] = finished_commit_id
+
+                if cb:
+                    cb(finished_rev, finished_tree_id, finished_commit_id)
+
+        try:
+            self.export_trees(cb=on_tree, **kwargs)
+
+            job_queue.put(('TERMINATE', None))
+
+            action, author_map = result_queue.get()
+            assert action == 'AUTHOR_MAP'
+            self.author_map = author_map
+
+            action, id_map = result_queue.get()
+            assert action == 'ID_MAP'
+            self.id_map = id_map
+        except:
+            worker.terminate()
+        finally:
+            worker.join()
+
     def export_trees(self, changeids=None, incremental=True, cb=None,
             auto_pack=True, auto_pack_interval=60,
             worker_pool_size=multiprocessing.cpu_count(),
-            major_chunk_size=100, reissue_chunk_size=3,
+            major_chunk_size=200, reissue_chunk_size=3,
             reissue_pending_threshold=5, reissue_skip_initial=1):
         """Export Git trees from Mercurial changesets.
 
@@ -678,6 +749,8 @@ class MercurialToGitConverter(object):
 
         This takes a changectx and a tree hash and writes out the Git commit
         object.
+
+        The SHA-1 of the resulting commit object is returned.
         """
         extra = ctx.extra()
 
@@ -727,7 +800,8 @@ class MercurialToGitConverter(object):
 
         commit.tree = tree_sha
         MercurialToGitConverter.robust_add_object(git, commit)
-        id_map[ctx.hex()] = commit.id
+
+        return commit.id
 
     @staticmethod
     def export_tree(ctx, git, tracker, incremental=True):
@@ -858,6 +932,8 @@ class MercurialToGitConverter(object):
 
         outstanding = []
         complained_starving = False
+        finished = set()
+        processed_count = 0
 
         while alive.value == 1:
             try:
@@ -866,11 +942,7 @@ class MercurialToGitConverter(object):
                 # If another worker finished a tree were have yet to compute
                 # we no longer need to compute that tree, obviously.
                 if name == 'TREE_COMPLETE':
-                    try:
-                        i = outstanding.index(data)
-                        del outstanding[i]
-                    except ValueError:
-                        pass
+                    finished.add(data)
 
                 continue
 
@@ -879,6 +951,11 @@ class MercurialToGitConverter(object):
 
             if len(outstanding):
                 node = outstanding[0]
+
+                if node in finished:
+                    outstanding.pop(0)
+                    continue
+
                 ctx = hg.changectx(node)
 
                 root_id, blobs = MercurialToGitConverter.export_tree(ctx,
@@ -886,6 +963,12 @@ class MercurialToGitConverter(object):
 
                 results.put(('TREE', (node, root_id)))
                 outstanding.pop(0)
+
+                processed_count += 1
+                if processed_count % 500 == 0:
+                    tracker = TreeTracker(hg)
+                    gc.collect()
+
                 continue
 
             try:
@@ -900,4 +983,37 @@ class MercurialToGitConverter(object):
                 results.put(('STARVED', None))
                 complained_starving = True
 
-            # TODO Perform GC?
+    @staticmethod
+    def _process_commits(ui_config, hg_path, git_path, author_map, id_map,
+        jobs, results):
+
+        git = Repo(git_path)
+
+        ui = hgui()
+        for section, name, value in ui_config:
+            ui.setconfig(section, name, value)
+
+        hg = repository(ui, hg_path)
+
+        while True:
+            action, data = jobs.get()
+
+            if action == 'TERMINATE':
+                return
+
+            if action != 'TREE':
+                raise AssertionError('Unknown action: %s' % action)
+
+            rev, tree_id = data
+            ctx = hg.changectx(rev)
+
+            state = ctx.extra().get('hg-git', None)
+            if state == 'octopus':
+                continue
+
+            commit_id = MercurialToGitConverter.export_commit_object(ctx, git,
+                tree_id, author_map, id_map)
+
+            id_map[ctx.hex()] = commit_id
+
+            results.put(('COMMIT', (rev, tree_id, commit_id)))

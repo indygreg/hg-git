@@ -375,22 +375,15 @@ class GitHandler(object):
             author_map=self.author_map, id_map=self._map_hg)
 
         i = [0]
-        def on_tree(rev, tree_id):
-            i[0] += 1
+        def on_commit(rev, tree_id, commit_id):
             ctx = self.repo.changectx(rev)
 
-            state = ctx.extra().get('hg-git', None)
-            if state == 'octopus':
-                self.ui.debug("revision %d is a part of octopus"
-                              "explosion\n" % ctx.rev())
-                return
-
-            self.ui.note(_("converting revision %s\n") % hex(rev))
-            gitexporter.MercurialToGitConverter.export_commit_object(ctx,
-                self.git, tree_id, self.author_map, self._map_hg)
+            self.ui.note(_('converting revision '), hex(rev), '\n')
             util.progress(self.ui, 'exporting', i[0], total=total)
 
-        exporter.export_trees(changeids=export, cb=on_tree)
+            self.map_set(commit_id, hex(rev))
+
+        exporter.export_changesets(changeids=export, cb=on_commit)
 
         util.progress(self.ui, 'importing', None, total=total)
 
