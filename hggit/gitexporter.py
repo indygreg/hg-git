@@ -328,6 +328,7 @@ class MercurialToGitConverter(object):
 
         job_queue = multiprocessing.Queue()
         result_queue = multiprocessing.Queue()
+        active = multiprocessing.Value('i', 1)
 
         config = list(self.hg.ui.walkconfig())
 
@@ -335,16 +336,10 @@ class MercurialToGitConverter(object):
             target=MercurialToGitConverter._process_commits,
             name='commit-processor',
             args=(config, self.hg.root, self.git.path, self.author_map,
-                self.id_map, job_queue, result_queue))
+                self.id_map, job_queue, result_queue, active))
         worker.start()
 
-        # Pulling items off of result_queue is suboptimally implemented.
-        # But, it's not a huge deal: it just delays the firing of the commit
-        # callback.
-
-        def on_tree(rev, tree_id):
-            job_queue.put(('TREE', (rev, tree_id)))
-
+        def process_results():
             results = []
             try:
                 while True:
@@ -353,29 +348,40 @@ class MercurialToGitConverter(object):
                 pass
 
             for action, data in results:
-                assert action == 'COMMIT'
+                if action == 'COMMIT':
+                    finished_rev, finished_tree_id, finished_commit_id = data
+                    ctx = self.hg.changectx(finished_rev)
 
-                finished_rev, finished_tree_id, finished_commit_id = data
-                ctx = self.hg.changectx(rev)
+                    self.id_map[ctx.hex()] = finished_commit_id
 
-                self.id_map[ctx.hex()] = finished_commit_id
+                    if cb:
+                        cb(finished_rev, finished_tree_id, finished_commit_id)
 
-                if cb:
-                    cb(finished_rev, finished_tree_id, finished_commit_id)
+                elif action == 'DONE':
+                    return True
+
+            return None
+
+        # Pulling items off of result_queue is suboptimally implemented.
+        # But, it's not a huge deal: it just delays the firing of the commit
+        # callback.
+
+        def on_tree(rev, tree_id):
+            job_queue.put(('TREE', (rev, tree_id)))
+
+            process_results()
 
         try:
             self.export_trees(cb=on_tree, **kwargs)
 
             job_queue.put(('TERMINATE', None))
 
-            action, author_map = result_queue.get()
-            assert action == 'AUTHOR_MAP'
-            self.author_map = author_map
+            while process_results() is None:
+                pass
 
-            action, id_map = result_queue.get()
-            assert action == 'ID_MAP'
-            self.id_map = id_map
+            active.value = 0
         except:
+            active.value = 0
             worker.terminate()
         finally:
             worker.join()
@@ -598,6 +604,8 @@ class MercurialToGitConverter(object):
             raise e
 
         finally:
+            alive.value = 0
+
             for worker in workers:
                 worker.join()
 
@@ -913,9 +921,16 @@ class MercurialToGitConverter(object):
         """Background process that performs periodic store packs."""
         git = Repo(git_path)
 
+        next_pack = time.time() + interval
+
         while alive.value == 1:
-            time.sleep(interval)
+            time.sleep(0.25)
+
+            if time.time() < next_pack:
+                continue
+
             git.object_store.pack_loose_objects()
+            next_pack = time.time() + interval
 
     @staticmethod
     def _process_tree_export(ui_config, hg_path, git_path, incremental,
@@ -985,7 +1000,7 @@ class MercurialToGitConverter(object):
 
     @staticmethod
     def _process_commits(ui_config, hg_path, git_path, author_map, id_map,
-        jobs, results):
+        jobs, results, active):
 
         git = Repo(git_path)
 
@@ -995,10 +1010,11 @@ class MercurialToGitConverter(object):
 
         hg = repository(ui, hg_path)
 
-        while True:
+        while active.value:
             action, data = jobs.get()
 
             if action == 'TERMINATE':
+                results.put(('DONE', None))
                 return
 
             if action != 'TREE':
