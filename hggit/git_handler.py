@@ -408,7 +408,8 @@ class GitHandler(object):
         self.swap_out_encoding(oldenc)
         return commit.id
 
-    def get_valid_git_username_email(self, name):
+    @staticmethod
+    def get_valid_git_username_email(name):
         r"""Sanitize usernames and emails to fit git's restrictions.
 
         The following is taken from the man page of git's fast-import
@@ -440,7 +441,7 @@ class GitHandler(object):
         TESTS:
 
         >>> from mercurial.ui import ui
-        >>> g = GitHandler('', ui()).get_valid_git_username_email
+        >>> g = GitHandler.get_valid_git_username_email
         >>> g('John Doe')
         'John Doe'
         >>> g('john@doe.com')
@@ -464,16 +465,18 @@ class GitHandler(object):
         # check for git author pattern compliance
         a = RE_GIT_AUTHOR.match(author)
 
+        get_valid = GitHandler.get_valid_git_username_email
+
         if a:
-            name = self.get_valid_git_username_email(a.group(1))
-            email = self.get_valid_git_username_email(a.group(2))
+            name = get_valid(a.group(1))
+            email = get_valid(a.group(2))
             if a.group(3) != None and len(a.group(3)) != 0:
                 name += ' ext:(' + urllib.quote(a.group(3)) + ')'
-            author = self.get_valid_git_username_email(name) + ' <' + self.get_valid_git_username_email(email) + '>'
+            author = get_valid(name) + ' <' + get_valid(email) + '>'
         elif '@' in author:
-            author = self.get_valid_git_username_email(author) + ' <' + self.get_valid_git_username_email(author) + '>'
+            author = get_valid(author) + ' <' + get_valid(author) + '>'
         else:
-            author = self.get_valid_git_username_email(author) + ' <none@none>'
+            author = get_valid(author) + ' <none@none>'
 
         if 'author' in ctx.extra():
             author = "".join(apply_delta(author, ctx.extra()['author']))
