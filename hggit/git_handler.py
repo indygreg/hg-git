@@ -2,7 +2,6 @@ import os, math, urllib, re
 import stat, posixpath, StringIO
 
 from dulwich.errors import HangupException, GitProtocolError, UpdateRefsError
-from dulwich.index import commit_tree
 from dulwich.objects import Blob, Commit, Tag, Tree, parse_timezone, S_IFGITLINK
 from dulwich.pack import create_delta, apply_delta
 from dulwich.repo import Repo
@@ -28,6 +27,8 @@ from mercurial import error
 import _ssh
 import util
 from overlay import overlayrepo
+
+from .hg2git import TreeTracker
 
 RE_GIT_AUTHOR = re.compile('^(.*?) ?\<(.*?)(?:\>(.*))?$')
 
@@ -328,6 +329,9 @@ class GitHandler(object):
         total = len(export)
         if total:
             self.ui.status(_("exporting hg objects to git\n"))
+
+        tracker = TreeTracker(self.repo)
+
         for i, rev in enumerate(export):
             util.progress(self.ui, 'exporting', i, total=total)
             ctx = self.repo.changectx(rev)
@@ -336,14 +340,14 @@ class GitHandler(object):
                 self.ui.debug("revision %d is a part "
                               "of octopus explosion\n" % ctx.rev())
                 continue
-            self.export_hg_commit(rev)
+            self.export_hg_commit(rev, tracker)
         util.progress(self.ui, 'importing', None, total=total)
 
 
     # convert this commit into git objects
     # go through the manifest, convert all blobs/trees we don't have
     # write the commit object (with metadata info)
-    def export_hg_commit(self, rev):
+    def export_hg_commit(self, rev, tracker):
         self.ui.note(_("converting revision %s\n") % hex(rev))
 
         oldenc = self.swap_out_encoding()
@@ -395,7 +399,11 @@ class GitHandler(object):
         if 'encoding' in extra:
             commit.encoding = extra['encoding']
 
-        tree_sha = commit_tree(self.git.object_store, self.iterblobs(ctx))
+        for obj in tracker.update_changeset(ctx):
+            self.git.object_store.add_object(obj)
+
+        tree_sha = tracker.root_tree_sha
+
         if tree_sha not in self.git.object_store:
             raise hgutil.Abort(_('Tree SHA-1 not present in Git repo: %s' %
                 tree_sha))
@@ -540,43 +548,6 @@ class GitHandler(object):
             message += "\n--HG--\n" + extra_message
 
         return message
-
-    def iterblobs(self, ctx):
-        if '.hgsubstate' in ctx:
-            hgsub = util.OrderedDict()
-            if '.hgsub' in ctx:
-                hgsub = util.parse_hgsub(ctx['.hgsub'].data().splitlines())
-            hgsubstate = util.parse_hgsubstate(ctx['.hgsubstate'].data().splitlines())
-            for path, sha in hgsubstate.iteritems():
-                try:
-                    if path in hgsub and not hgsub[path].startswith('[git]'):
-                        # some other kind of a repository (e.g. [hg])
-                        # that keeps its state in .hgsubstate, shall ignore
-                        continue
-                    yield path, sha, S_IFGITLINK
-                except ValueError:
-                    pass
-
-        for f in ctx:
-            if f == '.hgsubstate' or f == '.hgsub':
-                continue
-            fctx = ctx[f]
-            blobid = self.map_git_get(hex(fctx.filenode()))
-
-            if not blobid:
-                blob = Blob.from_string(fctx.data())
-                self.git.object_store.add_object(blob)
-                self.map_set(blob.id, hex(fctx.filenode()))
-                blobid = blob.id
-
-            if 'l' in ctx.flags(f):
-                mode = 0120000
-            elif 'x' in ctx.flags(f):
-                mode = 0100755
-            else:
-                mode = 0100644
-
-            yield f, blobid, mode
 
     def getnewgitcommits(self, refs=None):
         self.init_if_missing()
