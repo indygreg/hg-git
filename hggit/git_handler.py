@@ -21,6 +21,7 @@ except ImportError:
 
 from mercurial.i18n import _
 from mercurial.node import hex, bin, nullid
+from mercurial.scmutil import revrange
 from mercurial import context, util as hgutil
 from mercurial import error
 
@@ -224,11 +225,15 @@ class GitHandler(object):
 
         return len(modheads)
 
-    def export_commits(self):
+    def export_commits(self, **kwargs):
         try:
-            self.export_git_objects()
-            self.export_hg_tags()
-            self.update_references()
+            self.export_git_objects(**kwargs)
+
+            # Don't export tags and references if we specified changesets
+            # because they likely aren't present and this would likely error.
+            if 'changeids' not in kwargs:
+                self.export_hg_tags()
+                self.update_references()
         finally:
             self.save_map()
 
@@ -321,18 +326,23 @@ class GitHandler(object):
 
     ## CHANGESET CONVERSION METHODS
 
-    def export_git_objects(self):
+    def export_git_objects(self, **kwargs):
         self.init_if_missing()
 
-        nodes = [self.repo.lookup(n) for n in self.repo]
-        export = [node for node in nodes if not hex(node) in self._map_hg]
+        if 'changeids' in kwargs:
+            export = [node for node in kwargs['changeids']]
+            del kwargs['changeids']
+        else:
+            nodes = [self.repo.lookup(n) for n in self.repo]
+            export = [node for node in nodes if hex(node) not in self._map_hg]
+
         total = len(export)
         if total:
             self.ui.status(_("exporting hg objects to git\n"))
 
         converter = MercurialToGitConverter(self.repo, self.git)
         i = 0
-        for rev, tree_sha in converter.export_trees(export):
+        for rev, tree_sha in converter.export_trees(export, **kwargs):
             i += 1
             util.progress(self.ui, 'exporting', i, total=total)
 
