@@ -295,7 +295,11 @@ class MercurialToGitConverter(object):
         # Try to balance out work across all workers when we have a small
         # number of changesets.
         if len(changeids) < batch_size * worker_pool_size:
-            batch_size = len(changeids) / worker_pool_size
+            # If we have a really small number, just give them to one worker.
+            if len(changeids) < worker_pool_size:
+                batch_size = worker_pool_size
+            else:
+                batch_size = len(changeids) / worker_pool_size
 
         batches = [changeids[i:i+batch_size] for i in range(0, len(changeids),
             batch_size)]
