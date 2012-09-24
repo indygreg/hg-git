@@ -482,11 +482,17 @@ class MercurialToGitConverter(object):
         that the two processes will continuously trigger locking issues. It
         isn't perfect but it does get the job done.
         """
+        failed = 0
         while True:
             try:
                 git.object_store.add_object(obj)
                 return
             except OSError as e:
+                # Don't spin forever.
+                failed += 1
+                if failed >= 10:
+                    raise e
+
                 # 17 is for obtaining the exclusive lock. 2 is the bug on
                 # releasing it.
                 if e.errno in (2, 17):
