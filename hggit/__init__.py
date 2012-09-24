@@ -155,11 +155,15 @@ def git_cleanup(ui, repo):
     map(f.write, new_map)
     ui.status(_('git commit map cleaned\n'))
 
-def gmap_prune(ui, repo, rev):
-    revs = revrange(repo, rev)
-
+def gmap_prune(ui, repo, rev=None, prune_non_changesets=False):
     git = GitHandler(repo, ui)
-    git.prune_hg_map_changesets(revs)
+
+    if rev:
+        revs = revrange(repo, rev)
+        git.prune_hg_map_changesets(revs)
+
+    if prune_non_changesets:
+        git.prune_hg_map_nonchangesets()
 
 # drop this when we're 1.6-only, this just backports new behavior
 def sortednodetags(orig, *args, **kwargs):
@@ -259,6 +263,8 @@ cmdtable = {
         "Cleans up git repository after history editing")),
   "gmap-prune":
         (gmap_prune, [
-          ('r', 'rev', [], 'Changeset revisions to prune'),
+            ('r', 'rev', [], 'Changeset revisions to prune'),
+            ('p', 'prune-non-changesets', False,
+                'Prune non-changesets from the mapping file'),
         ], _('hg gmap-prune -r REVS')),
 }
