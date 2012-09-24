@@ -28,7 +28,7 @@ import _ssh
 import util
 from overlay import overlayrepo
 
-from .hg2git import TreeTracker
+from .hg2git import MercurialToGitConverter
 
 RE_GIT_AUTHOR = re.compile('^(.*?) ?\<(.*?)(?:\>(.*))?$')
 
@@ -330,24 +330,28 @@ class GitHandler(object):
         if total:
             self.ui.status(_("exporting hg objects to git\n"))
 
-        tracker = TreeTracker(self.repo)
-
-        for i, rev in enumerate(export):
+        converter = MercurialToGitConverter(self.repo, self.git)
+        i = 0
+        for rev, tree_sha in converter.export_trees(export):
+            i += 1
             util.progress(self.ui, 'exporting', i, total=total)
+
             ctx = self.repo.changectx(rev)
             state = ctx.extra().get('hg-git', None)
             if state == 'octopus':
-                self.ui.debug("revision %d is a part "
-                              "of octopus explosion\n" % ctx.rev())
+                self.ui.debug("revision %d is a part of octopus "
+                              "explosion\n" % ctx.rev())
                 continue
-            self.export_hg_commit(rev, tracker)
-        util.progress(self.ui, 'importing', None, total=total)
+
+            self.export_hg_commit(rev, tree_sha)
+
+        util.progress(self.ui, 'exporting', None, total=total)
 
 
     # convert this commit into git objects
     # go through the manifest, convert all blobs/trees we don't have
     # write the commit object (with metadata info)
-    def export_hg_commit(self, rev, tracker):
+    def export_hg_commit(self, rev, tree_sha):
         self.ui.note(_("converting revision %s\n") % hex(rev))
 
         oldenc = self.swap_out_encoding()
@@ -398,11 +402,6 @@ class GitHandler(object):
 
         if 'encoding' in extra:
             commit.encoding = extra['encoding']
-
-        for obj in tracker.update_changeset(ctx):
-            self.git.object_store.add_object(obj)
-
-        tree_sha = tracker.root_tree_sha
 
         if tree_sha not in self.git.object_store:
             raise hgutil.Abort(_('Tree SHA-1 not present in Git repo: %s' %
