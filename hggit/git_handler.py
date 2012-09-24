@@ -197,6 +197,26 @@ class GitHandler(object):
 
         self.save_map()
 
+    def prune_hg_map_nonchangesets(self):
+        """Prunes non-changeset entries from the mapping file."""
+        nodes = [hex(self.repo.lookup(n)) for n in self.repo]
+
+        pruned = {}
+        reverse = {}
+
+        for node in nodes:
+            sha = self._map_hg.get(node, None)
+            if sha is None:
+                continue
+
+            pruned[node] = sha
+            reverse[sha] = node
+
+        self._map_hg = pruned
+        self._map_git = reverse
+
+        self.save_map()
+
     def import_commits(self, remote_name):
         self.import_git_objects(remote_name)
         self.update_hg_bookmarks(self.git.get_refs())
