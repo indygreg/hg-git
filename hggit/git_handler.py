@@ -182,6 +182,21 @@ class GitHandler(object):
 
     ## COMMANDS METHODS
 
+    def prune_hg_map_changesets(self, revs):
+        """Prune the ID mapping of specified HG changesets."""
+        nodes = [self.repo.lookup(rev) for rev in revs]
+
+        for node in nodes:
+            h = hex(node)
+            sha = self._map_hg.get(h, None)
+            if sha is None:
+                continue
+
+            del self._map_hg[h]
+            del self._map_git[sha]
+
+        self.save_map()
+
     def import_commits(self, remote_name):
         self.import_git_objects(remote_name)
         self.update_hg_bookmarks(self.git.get_refs())
