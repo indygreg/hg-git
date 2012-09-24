@@ -34,6 +34,7 @@ from mercurial import templatekw
 from mercurial import util as hgutil
 from mercurial import url
 from mercurial.i18n import _
+from mercurial.scmutil import revrange
 
 demandimport.ignore.extend([
     'collections',
@@ -120,9 +121,27 @@ def gimport(ui, repo, remote_name=None):
     git = GitHandler(repo, ui)
     git.import_commits(remote_name)
 
-def gexport(ui, repo):
+def gexport(ui, repo, **opts):
+    m = {
+        'batch_size': 'batch_size',
+        'threads': 'worker_pool_size',
+        'pack_interval': 'auto_pack_interval',
+    }
+
+    args = {}
+    for k, v in m.items():
+        if k in opts and opts[k] != '':
+            args[v] = int(opts[k])
+
+    if 'disable_autopack' in opts:
+        args['auto_pack'] = not opts['disable_autopack']
+
+    if 'rev' in opts and opts['rev']:
+        args['changeids'] = [repo.lookup(n) for n in revrange(repo,
+            opts['rev'])]
+
     git = GitHandler(repo, ui)
-    git.export_commits()
+    git.export_commits(**args)
 
 def gclear(ui, repo):
     repo.ui.status(_("clearing out the git cache data\n"))
@@ -239,7 +258,16 @@ cmdtable = {
   "gimport":
         (gimport, [], _('hg gimport')),
   "gexport":
-        (gexport, [], _('hg gexport')),
+        (gexport, [
+            ('r', 'rev', [], 'Mercurial revision(s) to export to Git'),
+            ('b', 'batch_size', '', 'Batch size for processing jobs'),
+            ('d', 'disable-autopack', False,
+                'Disable automatic background packing during conversion'),
+            ('i', 'pack-interval', '',
+                'Interval for background repository packing (s)'),
+            ('t', 'threads', '',
+                'Number of threads to perform processing on'),
+        ], _('hg gexport')),
   "gclear":
       (gclear, [], _('Clears out the Git cached data')),
   "git-cleanup": (git_cleanup, [], _(
