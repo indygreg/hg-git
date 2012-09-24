@@ -2,11 +2,18 @@
 # repositories to Git repositories. Code in this file is meant to be a generic
 # library and should be usable outside the context of hg-git or an hg command.
 
+import multiprocessing
 import os
+import Queue
+import random
 import stat
+import time
 
 import dulwich.objects as dulobjs
+import dulwich.repo
+import mercurial.hg
 import mercurial.node
+import mercurial.ui
 
 import util
 
@@ -301,3 +308,251 @@ class IncrementalChangesetExporter(object):
         return (dulobjs.TreeEntry(os.path.basename(fctx.path()), mode, blob_id),
                 blob)
 
+
+class MercurialToGitConverter(object):
+    def __init__(self, hg_repo, git_repo):
+        self.hg = hg_repo
+        self.git = git_repo
+
+    def export_trees(self, changeids=None, auto_pack=True,
+            auto_pack_interval=60, batch_size=100,
+            worker_pool_size=multiprocessing.cpu_count()):
+        """Export Git trees for Mercurial changesets.
+
+        The caller specifies a list of Mercurial changesets to export. These
+        can be specified as numeric revisions or binary node IDs. This function
+        spins up a pool of worker processes that exports the Git trees for
+        these changesets. If no changesets are specified, all changesets are
+        exported.
+
+        This is a generator of 2-tuple of (node, tree_sha). Each node is
+        emitted in the order from the changeids input. If a tree finishes
+        export, the result is buffered until changesets before it from
+        changeids is emitted. This does not impact the overall execution time.
+        But, downstream consumers will appear to be starved.
+
+        By default, a background process will automatically pack loose objects
+        every 60 seconds. This prevents the number of loose objects in the Git
+        repository from becoming too unwieldy. For "small" exports (that take
+        less than auto_pack_interval seconds), automatic background packing
+        will never kick in.
+
+        To disable automatic background packing, just set auto_pack_interval to
+        False.
+
+        Work is distributed among a worker pool. By default, we spin up a
+        worker for each processor in the machine.
+
+        Work is distributed to each worker process in batches of adjacent
+        changesets. Processing adjacent changesets (specifically changesets
+        that are direct descendants of each other) is more efficient than
+        jumping around to disconnected changesets. Therefore, the larger the
+        batch size, the more efficient export will run. The risk with a large
+        batch size is that at the end of the export, workers will become
+        starved while 1 or a small number of workers has outstanding work. The
+        default batch size is small enough to mitigate this risk while large
+        enough to gain efficiency from adjacent changeset processing.
+        """
+
+        if changeids is None:
+            changeids = [self.hg.lookup(n) for n in self.hg]
+
+        # Each worker has a handle on a job queue, a result queue, and an
+        # "should I continue to be alive" flag.
+        job_queue = multiprocessing.Queue()
+        result_queue = multiprocessing.Queue()
+        alive = multiprocessing.Value('i', 1)
+
+        packer = None
+        if auto_pack:
+            packer = multiprocessing.Process(
+                target=MercurialToGitConverter._process_periodic_pack,
+                name='packer',
+                args=(self.git.path, auto_pack_interval, alive))
+
+            packer.start()
+
+        config = list(self.hg.ui.walkconfig())
+        workers = []
+        for i in range(worker_pool_size):
+            worker = multiprocessing.Process(
+                target=MercurialToGitConverter._process_tree_export,
+                args=(config, self.hg.root, self.git.path, job_queue,
+                    result_queue, alive))
+            worker.start()
+
+            workers.append(worker)
+
+        # Try to balance out work across all workers when we have a small
+        # number of changesets.
+        if len(changeids) < batch_size * worker_pool_size:
+            # If we have a really small number, just give them to one worker.
+            if len(changeids) < worker_pool_size:
+                batch_size = worker_pool_size
+            else:
+                batch_size = len(changeids) / worker_pool_size
+
+        batches = [changeids[i:i+batch_size] for i in range(0, len(changeids),
+            batch_size)]
+
+        for batch in batches:
+            job_queue.put(batch)
+
+        # Holds the results we have yet to emit.
+        pending = [rev for rev in changeids]
+
+        # Buffers results as they are received.
+        finished = {}
+
+        try:
+            while len(pending):
+                # Emit results as soon as we can.
+                if pending[0] in finished:
+                    yield (pending[0], finished[pending[0]])
+                    del finished[pending[0]]
+                    pending.pop(0)
+                    continue
+
+                results = []
+                wait = 0.25
+                try:
+                    # Grab as many results as possible.
+                    while True:
+                        results.append(result_queue.get(wait != 0, wait))
+                        wait = 0
+                except Queue.Empty:
+                    pass
+
+                for result_type, data in results:
+                    if result_type == 'TREE':
+                        finished[data[0]] = data[1]
+                        continue
+
+                    raise Exception('Unknown result type: %s', result_type)
+
+            alive.value = 0
+        except Exception as e:
+            alive.value = 0
+
+            for worker in workers:
+                worker.terminate()
+
+            if packer is not None:
+                packer.terminate()
+
+            raise e
+        finally:
+            alive.value = 0
+
+            for worker in workers:
+                worker.join()
+
+            # If packing started near the end of processing, this could take
+            # a while. But, packing needs to be done sometime. And, aborting
+            # would result in a temporary file in the object directory.
+            if packer is not None:
+                packer.join()
+
+    @staticmethod
+    def robust_add_object(git, obj):
+        """Robustly add an object to a Git repository.
+
+        There are race conditions between different processes when writing
+        objects to a Git repo. The underlying problem is that dulwich is
+        obtaining an exclusive lock every time it writes an object file.
+
+        If theory, we should be able to ignore the error and rely on the lock
+        owner to finish the write. Unfortunately, we can't just steam ahead
+        because as part of writing Tree objects, dulwich verifies that all
+        referenced objects in the Tree are present. So, this introduces another
+        race condition that must be avoided.
+
+        We work around this ugly mess by attempting writes into the Git repo
+        until it works without locking issues. This results in redundant work
+        when there is a contention issue, but that's unavoidable.
+
+        There is also a bug in dulwich locking mechanism. Essentially, it
+        doesn't do things atomically. It's not only possible for dulwich to
+        raise when trying to obtain the exclusive lock on the lock file, but
+        it can also fail when attempting to perform a rename as part of
+        releasing the lock.
+
+        When we encounter a locking issue, we sleep for a random amount of
+        time and then try again. The sleep is here to reduce the possibility
+        that the two processes will continuously trigger locking issues. It
+        isn't perfect but it does get the job done.
+        """
+        while True:
+            try:
+                git.object_store.add_object(obj)
+                return
+            except OSError as e:
+                # 17 is for obtaining the exclusive lock. 2 is the bug on
+                # releasing it.
+                if e.errno in (2, 17):
+                    ms = random.randint(100, 1000)
+                    time.sleep(ms / 1000.0)
+                    continue
+
+                raise e
+
+    @staticmethod
+    def _process_periodic_pack(git_path, interval, alive):
+        """Background process that performs periodic store packs."""
+        git = dulwich.repo.Repo(git_path)
+
+        next_pack = time.time() + interval
+
+        while alive.value == 1:
+            time.sleep(0.25)
+
+            if time.time() < next_pack:
+                continue
+
+            try:
+                git.object_store.pack_loose_objects()
+            except KeyboardInterrupt:
+                pass
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                continue
+
+            next_pack = time.time() + interval
+
+    @staticmethod
+    def _process_tree_export(ui_config, hg_path, git_path, jobs, results,
+        alive):
+        """Background process that performs tree export work."""
+
+        git = dulwich.repo.Repo(git_path)
+
+        ui = mercurial.ui.ui()
+        for section, name, value in ui_config:
+            ui.setconfig(section, name, value)
+
+        hg = mercurial.hg.repository(ui, hg_path)
+        exporter = IncrementalChangesetExporter(hg)
+
+        pending = []
+
+        while alive.value == 1:
+            if not len(pending):
+                try:
+                    pending.extend(jobs.get(True, 1))
+                except Queue.Empty:
+                    pass
+
+                if not len(pending):
+                    continue
+
+            # Only do one job per loop so we detect !alive quicker.
+            node = pending[0]
+            ctx = hg.changectx(node)
+
+            for obj, nodeid in exporter.update_changeset(ctx):
+                MercurialToGitConverter.robust_add_object(git, obj)
+
+            results.put(('TREE', (node, exporter.root_tree_sha)))
+
+            pending.pop(0)

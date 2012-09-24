@@ -387,27 +387,27 @@ class GitHandler(object):
         if total:
             self.ui.note(_("exporting hg objects to git\n"))
 
-        # By only exporting deltas, the assertion is that all previous objects
-        # for all other changesets are already present in the Git repository.
-        # This assertion is necessary to prevent redundant work.
-        exporter = hg2git.IncrementalChangesetExporter(self.repo)
-
-        for i, rev in enumerate(export):
+        converter = hg2git.MercurialToGitConverter(self.repo, self.git)
+        i = 0
+        for rev, tree_sha in converter.export_trees(export):
+            i += 1
             util.progress(self.ui, 'exporting', i, total=total)
+
             ctx = self.repo.changectx(rev)
             state = ctx.extra().get('hg-git', None)
             if state == 'octopus':
-                self.ui.debug("revision %d is a part "
-                              "of octopus explosion\n" % ctx.rev())
+                self.ui.debug("revision %d is a part of octopus "
+                              "explosion\n" % ctx.rev())
                 continue
-            self.export_hg_commit(rev, exporter)
-        util.progress(self.ui, 'importing', None, total=total)
 
+            self.export_hg_commit(rev, tree_sha)
+
+        util.progress(self.ui, 'exporting', None, total=total)
 
     # convert this commit into git objects
     # go through the manifest, convert all blobs/trees we don't have
     # write the commit object (with metadata info)
-    def export_hg_commit(self, rev, exporter):
+    def export_hg_commit(self, rev, tree_sha):
         self.ui.note(_("converting revision %s\n") % hex(rev))
 
         oldenc = self.swap_out_encoding()
@@ -464,11 +464,6 @@ class GitHandler(object):
 
         if 'encoding' in extra:
             commit.encoding = extra['encoding']
-
-        for obj, nodeid in exporter.update_changeset(ctx):
-            self.git.object_store.add_object(obj)
-
-        tree_sha = exporter.root_tree_sha
 
         if tree_sha not in self.git.object_store:
             raise hgutil.Abort(_('Tree SHA-1 not present in Git repo: %s' %
