@@ -55,7 +55,7 @@ class IncrementalChangesetExporter(object):
     more efficient.
     """
 
-    def __init__(self, hg_repo):
+    def __init__(self, hg_repo, blob_cache=None):
         """Create an instance against a mercurial.localrepo."""
         self._hg = hg_repo
 
@@ -67,7 +67,7 @@ class IncrementalChangesetExporter(object):
 
         # Mercurial file nodeid to Git blob SHA-1. Used to prevent redundant
         # blob calculation.
-        self._blob_cache = {}
+        self._blob_cache = blob_cache or {}
 
     @property
     def root_tree_sha(self):
@@ -316,7 +316,8 @@ class MercurialToGitConverter(object):
 
     def export_trees(self, changeids=None, auto_pack=True,
             auto_pack_interval=60, batch_size=100,
-            worker_pool_size=multiprocessing.cpu_count()):
+            worker_pool_size=multiprocessing.cpu_count(),
+            on_blob=None, existing_objects=None):
         """Export Git trees for Mercurial changesets.
 
         The caller specifies a list of Mercurial changesets to export. These
@@ -377,8 +378,8 @@ class MercurialToGitConverter(object):
         for i in range(worker_pool_size):
             worker = multiprocessing.Process(
                 target=MercurialToGitConverter._process_tree_export,
-                args=(config, self.hg.root, self.git.path, job_queue,
-                    result_queue, alive))
+                args=(config, self.hg.root, self.git.path, existing_objects,
+                    job_queue, result_queue, alive))
             worker.start()
 
             workers.append(worker)
@@ -426,6 +427,12 @@ class MercurialToGitConverter(object):
                 for result_type, data in results:
                     if result_type == 'TREE':
                         finished[data[0]] = data[1]
+                        continue
+
+                    if result_type == 'BLOB':
+                        if on_blob:
+                            on_blob(data[0], data[1])
+
                         continue
 
                     raise Exception('Unknown result type: %s', result_type)
@@ -527,8 +534,8 @@ class MercurialToGitConverter(object):
             next_pack = time.time() + interval
 
     @staticmethod
-    def _process_tree_export(ui_config, hg_path, git_path, jobs, results,
-        alive):
+    def _process_tree_export(ui_config, hg_path, git_path, existing_objects,
+        jobs, results, alive):
         """Background process that performs tree export work."""
 
         git = dulwich.repo.Repo(git_path)
@@ -538,7 +545,7 @@ class MercurialToGitConverter(object):
             ui.setconfig(section, name, value)
 
         hg = mercurial.hg.repository(ui, hg_path)
-        exporter = IncrementalChangesetExporter(hg)
+        exporter = IncrementalChangesetExporter(hg, blob_cache=existing_objects)
 
         pending = []
 
@@ -558,6 +565,9 @@ class MercurialToGitConverter(object):
 
             for obj, nodeid in exporter.update_changeset(ctx):
                 MercurialToGitConverter.robust_add_object(git, obj)
+
+                if nodeid is not None:
+                    results.put(('BLOB', (nodeid, obj.id)))
 
             results.put(('TREE', (node, exporter.root_tree_sha)))
 

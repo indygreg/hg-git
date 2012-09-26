@@ -397,9 +397,17 @@ class GitHandler(object):
         if total:
             self.ui.note(_("exporting hg objects to git\n"))
 
+        def on_blob(nodeid, sha):
+            self.map_set(sha, hex(nodeid))
+
+        existing_objects = {}
+        for nodeid, sha in self._map_hg.iteritems():
+            existing_objects[bin(nodeid)] = sha
+
         converter = hg2git.MercurialToGitConverter(self.repo, self.git)
         i = 0
-        for rev, tree_sha in converter.export_trees(export):
+        for rev, tree_sha in converter.export_trees(export, on_blob=on_blob,
+            existing_objects=existing_objects, **kwargs):
             i += 1
             util.progress(self.ui, 'exporting', i, total=total)
 
