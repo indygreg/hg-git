@@ -182,6 +182,40 @@ class GitHandler(object):
 
     ## COMMANDS METHODS
 
+    def verify_map(self, git_only=False, delete_missing=False):
+        self.init_if_missing()
+
+        self.verify_map_git_objects(delete_missing)
+
+    def verify_map_git_objects(self, delete_missing=False):
+        missing = {}
+
+        repo_shas = set(self.git.object_store)
+
+        total = len(self._map_git)
+        i = 0
+        for sha, node in self._map_git.iteritems():
+            i += 1
+            util.progress(self.ui, 'git-objects', i, total=total)
+
+            if sha in repo_shas:
+                continue
+
+            self.ui.status('Git object missing: %s\n' % sha)
+            missing[sha] = node
+
+        if not delete_missing:
+            return
+
+        for sha, node in missing.iteritems():
+            self.ui.status('Deleting HG -> Git mapping: %s -> %s\n' % (node,
+                sha))
+            del self._map_git[sha]
+            del self._map_hg[node]
+
+        self.save_map()
+
+
     def prune_hg_map_changesets(self, revs):
         """Prune the ID mapping of specified HG changesets."""
         nodes = [self.repo.lookup(rev) for rev in revs]

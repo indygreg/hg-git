@@ -164,6 +164,11 @@ def gmap_prune(ui, repo, rev=None, prune_non_changesets=False):
     if prune_non_changesets:
         git.prune_hg_map_nonchangesets()
 
+def gitmap_verify(ui, repo, git_only=False, delete_missing=False):
+    git = GitHandler(repo, ui)
+
+    git.verify_map(git_only=git_only, delete_missing=delete_missing)
+
 # drop this when we're 1.6-only, this just backports new behavior
 def sortednodetags(orig, *args, **kwargs):
     ret = orig(*args, **kwargs)
@@ -267,4 +272,9 @@ cmdtable = {
             ('p', 'prune-non-changesets', False,
                 'Prune non-changesets from the mapping file'),
         ], _('hg gmap-prune -r REVS')),
+  "gitmap-verify":
+        (gitmap_verify, [
+            ('g', 'git-only', False, 'Only verify Git objects.'),
+            ('d', 'delete-missing', False, 'Delete missing items.'),
+        ], _('hg gitmap-verify')),
 }
