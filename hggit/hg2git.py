@@ -78,11 +78,17 @@ class TreeTracker(object):
         # working directory.
         modified, added, removed = self._hg.status(self._rev, ctx.rev())[0:3]
 
-        for path in sorted(removed, key=len, reverse=True):
+        # We track which directories/trees have modified in this update and we
+        # only export those.
+        dirty_trees = set()
+
+        # We first process file removals so we can prune dead trees.
+        for path in removed:
             d = os.path.dirname(path)
             tree = self._dirs.get(d, Tree())
 
             del tree[os.path.basename(path)]
+            dirty_trees.add(d)
 
             if not len(tree):
                 self._remove_tree(d)
@@ -90,16 +96,21 @@ class TreeTracker(object):
 
             self._dirs[d] = tree
 
-        for path in sorted(set(modified) | set(added), key=len, reverse=True):
+        # For every file that changed or was added, we need to calculate the
+        # corresponding Git blob and its tree entry. We emit the blob
+        # immediately and update trees to be aware of its presence.
+        for path in set(modified) | set(added):
+            # Handle special Mercurial paths.
             if path == '.hgsubstate':
-                self._handle_subrepos(ctx)
+                self._handle_subrepos(ctx, dirty_trees)
                 continue
 
             if path == '.hgsub':
                 continue
 
             d = os.path.dirname(path)
-            tree = self._dirs.get(d, Tree())
+            tree = self._dirs.setdefault(d, Tree())
+            dirty_trees.add(d)
 
             fctx = ctx[path]
 
@@ -110,7 +121,12 @@ class TreeTracker(object):
             tree.add(*entry)
             self._dirs[d] = tree
 
-        for obj in self._populate_tree_entries():
+        # Now that all the trees represent the current changeset, recalculate
+        # the tree IDs and emit them. Note that we wait until now to calculate
+        # tree SHA-1s. This is an important difference between us and
+        # dulwich.index.commit_tree(), which builds new Tree instances for each
+        # series of blobs.
+        for obj in self._populate_tree_entries(dirty_trees):
             yield (obj, None)
 
         self._rev = ctx.rev()
@@ -151,9 +167,8 @@ class TreeTracker(object):
             basename = os.path.basename(parent)
             parent = os.path.dirname(parent)
 
-    def _populate_tree_entries(self):
-        if '' not in self._dirs:
-            self._dirs[''] = Tree()
+    def _populate_tree_entries(self, dirty_trees):
+        self._dirs.setdefault('', Tree())
 
         # Fill in missing directories.
         for path in self._dirs.keys():
@@ -168,18 +183,44 @@ class TreeTracker(object):
                 self._dirs[parent] = Tree()
                 parent = os.path.dirname(parent)
 
-        # TODO only emit trees that have been modified.
-        for d in sorted(self._dirs.keys(), key=len, reverse=True):
-            tree = self._dirs[d]
+        for dirty in list(dirty_trees):
+            parent = os.path.dirname(dirty)
+
+            while parent != '':
+                if parent in dirty_trees:
+                    break
+
+                dirty_trees.add(parent)
+                parent = os.path.dirname(parent)
+
+        # The root tree is always dirty but doesn't always get updated.
+        dirty_trees.add('')
+
+        # We only need to recalculate and export dirty trees.
+        for d in sorted(dirty_trees, key=len, reverse=True):
+            # Only happens for deleted directories.
+            try:
+                tree = self._dirs[d]
+            except KeyError:
+                continue
+
             yield tree
 
             if d == '':
                 continue
 
             parent_tree = self._dirs[os.path.dirname(d)]
+
+            # Accessing the tree's ID is what triggers SHA-1 calculation and is
+            # the expensive part (at least if the tree has been modified since
+            # the last time we retrieved its ID). Also, assigning an entry to a
+            # tree (even if it already exists) invalidates the existing tree
+            # and incurs SHA-1 recalculation. So, it's in our interest to avoid
+            # invalidating trees. Since we only update the entries of dirty
+            # trees, this should hold true.
             parent_tree[os.path.basename(d)] = (stat.S_IFDIR, tree.id)
 
-    def _handle_subrepos(self, ctx):
+    def _handle_subrepos(self, ctx, dirty_trees):
         substate = util.parse_hgsubstate(ctx['.hgsubstate'].data().splitlines())
         sub = util.OrderedDict()
 
@@ -192,9 +233,9 @@ class TreeTracker(object):
                 continue
 
             d = os.path.dirname(path)
-            tree = self._dirs.get(d, Tree())
+            dirty_trees.add(d)
+            tree = self._dirs.setdefault(d, Tree())
             tree.add(os.path.basename(path), S_IFGITLINK, sha)
-            self._dirs[d] = tree
 
     @staticmethod
     def tree_entry(fctx, blob_cache):
